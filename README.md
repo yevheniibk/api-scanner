@@ -49,7 +49,7 @@ python scanner.py
 - `0` — вразливостей не знайдено
 - `1` — знайдено хоча б один `FAIL` або критична помилка запуску
 
----
+--- 
 
 ## Що перевіряє сканер
 
@@ -220,44 +220,6 @@ not applicable: 26
 }
 ```
 
----
-
-## Інтеграція з GitHub Actions
-
-Помістіть файл `.github/workflows/api-security-scan.yml` у репозиторій.
-
-### Структура репозиторію
-
-```
-repo/
-├── scanner.py
-├── requirements.txt                   # requests
-├── VAmPI.postman_collection.json
-└── .github/
-    └── workflows/
-        └── api-security-scan.yml
-```
-
-### Тригери
-
-| Тригер | Поведінка |
-|--------|-----------|
-| `push` до `main` / `develop` | Запуск сканування |
-| `pull_request` до `main` | Запуск + коментар з результатами у PR |
-| `schedule` (щодня о 3:00 UTC) | Нічна перевірка регресій |
-| `workflow_dispatch` | Ручний запуск через GitHub UI |
-
-### Що робить workflow
-
-1. Клонує VAmPI і запускає його у фоні
-2. Очікує готовності сервера (health check, 15 спроб)
-3. Запускає `python scanner.py`
-4. Зберігає `scan_report.json` як артефакт (зберігається 30 днів)
-5. При PR — публікує таблицю результатів у коментарі
-
-### Exit code і блокування merge
-
-`scanner.py` завершується з кодом `1` якщо є хоча б один `FAIL`. Workflow правильно інтерпретує це як провал — merge буде заблокований до усунення вразливостей (якщо увімкнений branch protection).
 
 ---
 
