@@ -1,0 +1,107 @@
+name: API Security Scan
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  # Run nightly on main to catch regressions
+  schedule:
+    - cron: "0 3 * * *"
+  # Allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    name: Run VAmPI Security Scanner
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install scanner dependencies
+        run: pip install -r requirements.txt
+
+      # ── 3. Start VAmPI ───────────────────────────────────────────────────────
+      - name: Install VAmPI dependencies
+        run: |
+          pip install flask flask-sqlalchemy pyjwt
+
+      - name: Clone VAmPI
+        run: |
+          git clone https://github.com/erev0s/VAmPI.git vampi-app
+
+      - name: Start VAmPI in background
+        run: |
+          cd vampi-app
+          python app.py &
+          echo "VAmPI PID: $!"
+
+      - name: Wait for VAmPI to be ready
+        run: |
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:5000/ > /dev/null 2>&1; then
+              echo "VAmPI is up after ${i}s"
+              exit 0
+            fi
+            echo "Waiting... ($i/15)"
+            sleep 1
+          done
+          echo "ERROR: VAmPI did not start in time"
+          exit 1
+
+      # ── 4. Run scanner ───────────────────────────────────────────────────────
+      - name: Run security scanner
+        # exit code 1 = vulnerabilities found — step will fail, job will fail
+        run: python scanner.py
+
+      # ── 5. Upload report (always, even on failure) ───────────────────────────
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-report-${{ github.run_number }}
+          path: scan_report.json
+          retention-days: 30
+
+      # ── 6. Post summary to PR (optional, only on pull_request) ───────────────
+      - name: Post scan summary to PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('scan_report.json', 'utf8'));
+            const s = report.summary;
+            const icon = s.fail > 0 ? '🔴' : '🟢';
+            const body = [
+              `## ${icon} API Security Scan Results`,
+              '',
+              `| Metric | Value |`,
+              `|--------|-------|`,
+              `| Endpoints | ${s.endpoints} |`,
+              `| Checks run | ${s.executed_checks} |`,
+              `| ❌ FAIL | ${s.fail} |`,
+              `| ✅ PASS | ${s.pass} |`,
+              `| ⚠️ REVIEW | ${s.review} |`,
+              '',
+              s.fail > 0
+                ? `> **${s.fail} security issue(s) found. See the \`scan-report\` artifact for details.**`
+                : '> No security issues found.',
+            ].join('\n');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
