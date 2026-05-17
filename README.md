@@ -14,7 +14,6 @@
 - [Що перевіряє сканер](#що-перевіряє-сканер)
 - [Конфігурація](#конфігурація)
 - [Як читати звіт](#як-читати-звіт)
-- [JSON-звіт](#json-звіт)
 - [Архітектура](#архітектура)
 - [Відомі обмеження](#відомі-обмеження)
 
@@ -42,13 +41,11 @@ pip install requests
 python scanner.py
 ```
 
-Після завершення в консолі буде звіт, а у файлі `scan_report.json` — машинозчитувана версія.
-
 **Exit codes:**
 - `0` — вразливостей не знайдено
 - `1` — знайдено хоча б один `FAIL` або критична помилка запуску
 
---- 
+---
 
 ## Що перевіряє сканер
 
@@ -183,45 +180,6 @@ not applicable: 26
 
 ---
 
-## JSON-звіт
-
-Після кожного запуску сканер зберігає `scan_report.json`:
-
-```json
-{
-  "endpoints": [
-    {
-      "method": "GET",
-      "path": "/books/v1/bookTitle77",
-      "name": "Retrieves book by title along with secret",
-      "url": "http://127.0.0.1:5000/books/v1/bookTitle77",
-      "excluded": false,
-      "checks": {
-        "bola": {
-          "status": "FAIL",
-          "http_status": 200,
-          "reason": "Attacker accessed or modified victim-owned object",
-          "evidence": ["..."]
-        },
-        "auth": { "status": "PASS", ... },
-        "data": { "status": "FAIL", ... }
-      }
-    }
-  ],
-  "summary": {
-    "endpoints": 14,
-    "executed_checks": 16,
-    "fail": 5,
-    "pass": 11,
-    "review": 0,
-    "not_applicable": 26
-  }
-}
-```
-
-
----
-
 ## Архітектура
 
 ```
@@ -262,7 +220,7 @@ scanner.py
 │   └── scan_bola()           # ендпоінти з ідентифікаторами → запит від атакуючого
 │
 ├── REPORT
-│   ├── print_endpoint_report() # консольний звіт + запис scan_report.json
+│   ├── print_endpoint_report() # виводить звіт у консоль
 │   └── print_check_result()    # форматування одного результату перевірки
 │
 └── main()                    # точка входу, exit 1 при FAIL
