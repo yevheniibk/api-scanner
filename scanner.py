@@ -1,713 +1,462 @@
 """
-API Security Scanner — VAmPI
-============================
+API Security Scanner — VAmPI + Postman Collection
+=================================================
 
-Automated scanner for detecting common API vulnerabilities based on
-OWASP API Security Top 10. Reads an OpenAPI/Swagger specification and
-uses it to generate and execute targeted attack scenarios.
+Features:
+- Uses Postman collection as the only endpoint source.
+- Does not use OpenAPI / Swagger.
+- Does not use Postman environment.
+- Uses hardcoded BASE_URL and VAmPI dummy data.
+- Excludes setup endpoints like /createdb from scans.
+- Runs:
+  1. Excessive Data Exposure
+  2. Broken Authentication
+  3. BOLA / IDOR
+- Prints endpoint-based report.
 
-Covered vulnerability classes
-------------------------------
-- OWASP API1: Broken Object Level Authorization (BOLA / IDOR)
-- OWASP API2: Broken Authentication
-- OWASP API3: Excessive Data Exposure
-
-How it works
-------------
-1. Resets the target database and creates two users: attacker and victim.
-2. The victim creates a resource (book with a secret).
-3. Three independent scanners run sequentially, each returning a
-   structured result object.
-4. A final report aggregates all findings and prints a summary.
-
-Usage
------
+Usage:
     python scanner.py
 
-Requirements
-------------
-- Running VAmPI instance at BASE_URL
-- openapi.json file in the working directory
-- requests library: pip install requests
+Requirements:
+    pip install requests
 
-Notes
------
-BASE_URL and credentials are hardcoded. This script is intended as a
-learning/testing tool and is not designed for use against production systems.
+Required file:
+    VAmPI.postman_collection.json
 """
 
+from __future__ import annotations
+
 import json
+import sys
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
 import requests
 
 
-# --- НАЛАШТУВАННЯ ---
+# --- CONFIG ---
 
 BASE_URL = "http://127.0.0.1:5000"
-OPENAPI_FILE = "openapi.json"
+POSTMAN_COLLECTION_FILE = "VAmPI.postman_collection.json"
+REQUEST_TIMEOUT = 10
 
 ATTACKER = {
-    "username": "attacker_user",
-    "password": "pass123",
-    "email": "attacker@test.com"
+    "username": "name2",
+    "password": "pass2",
+    "email": "mail2@mail.com"
 }
 
 VICTIM = {
-    "username": "victim_user",
-    "password": "pass123",
-    "email": "victim@test.com"
+    "username": "name1",
+    "password": "pass1",
+    "email": "mail1@mail.com"
 }
 
 VICTIM_BOOK = {
-    "book_title": "victim_secret_book",
-    "secret": "secret_from_victim"
+    "book_title": "bookTitle77",
+    "secret": "secret for bookTitle77"
 }
 
-METHOD_ORDER = {
-    "get": 1,
-    "post": 2,
-    "put": 3,
-    "delete": 4
-}
-"""Defines execution order for HTTP methods within a single path."""
-
-CANDIDATE_METHODS = {"GET", "POST", "PUT", "DELETE"}
-"""HTTP methods considered for BOLA scanning."""
-
-RESOURCE_PARAMS = {
-    "id", "user_id", "userid", "userId",
-    "username", "book", "book_title",
-    "resource_id", "owner_id", "account_id"
-}
-"""
-Path parameter names that suggest a resource identifier.
-Used to identify BOLA candidates in OpenAPI paths.
-"""
-
-PARAM_VALUES = {
+HARDCODED_VALUES = {
+    "baseUrl": BASE_URL.rstrip("/"),
     "username": VICTIM["username"],
+    "book_title": VICTIM_BOOK["book_title"],
     "book": VICTIM_BOOK["book_title"],
-    "book_title": VICTIM_BOOK["book_title"],
 }
-"""
-Mapping of path parameter names to victim's values.
-The attacker uses these values to access resources belonging to the victim.
-"""
 
-FIELD_VALUES = {
-    "email": "changed_by_attacker@test.com",
-    "password": "new_password_by_attacker",
-    "book_title": VICTIM_BOOK["book_title"],
-    "secret": "new_secret_by_attacker",
+# Setup/admin endpoints must not be scanned because they change application state.
+EXCLUDED_SCAN_PATHS = {
+    "/createdb"
 }
-"""
-Mapping of request body field names to attacker-controlled values.
-Used when building request bodies from OpenAPI schema definitions.
-"""
+
+# DELETE is destructive, so it is not executed by default in BOLA checks.
+ENABLE_DESTRUCTIVE_BOLA = False
 
 SENSITIVE_FIELDS = {
-    "password", "token", "secret",
-    "admin", "is_admin", "role",
-    "hash", "debug"
+    "password",
+    "token",
+    "auth_token",
+    "secret",
+    "hash",
+    "debug"
 }
-"""
-Field names considered sensitive in API responses.
-Used by the Excessive Data Exposure scanner.
-"""
 
 SUCCESS_STATUSES = {
-    "GET": [200],
-    "POST": [200],
-    "PUT": [200, 204],
-    "DELETE": [200, 204]
+    "GET": {200},
+    "POST": {200, 201},
+    "PUT": {200, 204},
+    "PATCH": {200, 204},
+    "DELETE": {200, 204}
 }
-"""HTTP status codes that indicate a successful (and potentially unauthorized) response."""
 
-PROTECTED_STATUSES = [401, 403, 404]
-"""HTTP status codes that indicate access was correctly denied."""
+PROTECTED_STATUSES = {401, 403, 404}
+
+BOLA_RESOURCE_KEYS = {
+    "id",
+    "user_id",
+    "userid",
+    "username",
+    "book",
+    "book_title",
+    "resource_id",
+    "owner_id",
+    "account_id"
+}
+
+BOLA_METHODS = {"GET", "PUT", "PATCH", "DELETE"}
+
+BOLA_METHOD_ORDER = {
+    "GET": 1,
+    "PUT": 2,
+    "PATCH": 3,
+    "DELETE": 4
+}
+
+STATUS_FAIL = "FAIL"
+STATUS_PASS = "PASS"
+STATUS_REVIEW = "REVIEW"
+STATUS_NA = "N/A"
 
 
-# --- HTTP ---
+# --- MODELS ---
 
-def send_request(method, url, token=None, json_data=None):
-    """
-    Send an HTTP request and return the status code and parsed body.
+@dataclass(frozen=True)
+class Endpoint:
+    name: str
+    folder: str
+    method: str
+    raw_url: str
+    url: str
+    path: str
+    resolved_path: str
+    headers: dict
+    body: dict | list | str | None
+    body_mode: str | None
+    auth_type: str | None
+    path_variables: dict
 
-    Automatically sets Content-Type and Authorization headers when
-    applicable. Falls back to raw text if the response body is not
-    valid JSON.
+    @property
+    def key(self) -> str:
+        return f"{self.method} {self.resolved_path}"
 
-    Args:
-        method (str): HTTP method (e.g. "GET", "POST").
-        url (str): Full request URL.
-        token (str | None): Bearer token for Authorization header.
-            If None, the header is omitted.
-        json_data (dict | None): Request body to serialize as JSON.
-            If None, Content-Type header is omitted.
+    @property
+    def is_excluded_from_scan(self) -> bool:
+        return self.resolved_path in EXCLUDED_SCAN_PATHS
 
-    Returns:
-        tuple[int, dict | str]: A tuple of (status_code, body), where
-            body is a parsed dict if the response is JSON,
-            or a raw string otherwise.
-    """
-    headers = {"Accept": "application/json"}
 
-    if json_data is not None:
-        headers["Content-Type"] = "application/json"
+@dataclass
+class CheckResult:
+    status: str
+    http_status: int | None = None
+    reason: str = ""
+    evidence: list[str] | None = None
+
+
+# --- HTTP CLIENT ---
+
+def send_request(method, url, token=None, body=None, headers=None):
+    final_headers = {"Accept": "application/json"}
+
+    if headers:
+        final_headers.update(headers)
+
+    # Scanner controls Authorization itself.
+    final_headers.pop("Authorization", None)
 
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        final_headers["Authorization"] = f"Bearer {token}"
 
-    response = requests.request(
-        method=method,
-        url=url,
-        headers=headers,
-        json=json_data,
-        timeout=10
-    )
+    request_kwargs = {
+        "method": method,
+        "url": url,
+        "headers": final_headers,
+        "timeout": REQUEST_TIMEOUT
+    }
+
+    if body is not None:
+        if isinstance(body, (dict, list)):
+            final_headers["Content-Type"] = "application/json"
+            request_kwargs["json"] = body
+        else:
+            request_kwargs["data"] = body
 
     try:
-        body = response.json()
-    except ValueError:
-        body = response.text
+        response = requests.request(**request_kwargs)
 
-    return response.status_code, body
+        try:
+            response_body = response.json()
+        except ValueError:
+            response_body = response.text
+
+        return response.status_code, response_body
+
+    except requests.RequestException as error:
+        return 0, {"error": str(error)}
 
 
-# --- SETUP VAmPI ---
+def send_endpoint_request(endpoint, token=None, body_override=None):
+    body = body_override
 
-def reset_db():
-    """
-    Reset the VAmPI database to a clean state.
+    if body is None and endpoint.method in {"POST", "PUT", "PATCH"}:
+        body = endpoint.body
 
-    Sends GET /createdb to drop and recreate all tables.
-    Must be called before registering users to avoid conflicts
-    from previous test runs.
-    """
+    return send_request(
+        method=endpoint.method,
+        url=endpoint.url,
+        token=token,
+        body=body,
+        headers=endpoint.headers
+    )
+
+
+# --- VAMPI SETUP ---
+
+def setup_vampi():
     print("[1] Reset database")
     status, body = send_request("GET", f"{BASE_URL}/createdb")
     print("Status:", status)
-    print("Response:", body)
+
+    if status != 200:
+        raise RuntimeError(f"Database reset failed: {body}")
+
+    print("[2] Register attacker")
+    _register_user(ATTACKER)
+
+    print("[3] Register victim")
+    _register_user(VICTIM)
+
+    print("[4] Login attacker")
+    attacker_token = login_user(ATTACKER)
+
+    print("[5] Login victim")
+    victim_token = login_user(VICTIM)
+
+    print("[6] Create victim's book")
+    _create_victim_book(victim_token)
+
+    return attacker_token, victim_token
 
 
-def register_user(user):
+def _create_victim_book(victim_token):
+    """Create the victim's book with the victim's token.
+
+    Idempotent: ignores 'already exists' responses so it is safe to call
+    even when /createdb already inserted the book.
     """
-    Register a new user via the VAmPI registration endpoint.
+    status, body = send_request(
+        "POST",
+        f"{BASE_URL}/books/v1",
+        token=victim_token,
+        body={
+            "book_title": VICTIM_BOOK["book_title"],
+            "secret": VICTIM_BOOK["secret"]
+        }
+    )
+    print("Status:", status, body)
 
-    Args:
-        user (dict): User data with keys: username, password, email.
-    """
-    print(f"[2] Register user: {user['username']}")
+    already_exists = (
+        status == 400
+        and isinstance(body, dict)
+        and any(word in str(body).lower() for word in ("exist", "already", "duplicate"))
+    )
 
+    if status not in {200, 201} and not already_exists:
+        raise RuntimeError(f"Failed to create victim book: {body}")
+
+
+def _register_user(user):
+    """Register a user, ignoring 'already exists' responses."""
     status, body = send_request(
         "POST",
         f"{BASE_URL}/users/v1/register",
-        json_data={
-            "email": user["email"],
+        body={
+            "username": user["username"],
             "password": user["password"],
-            "username": user["username"]
+            "email": user["email"]
         }
     )
-
-    print("Status:", status)
-    print("Response:", body)
+    print("Status:", status, body)
+    # 200/201 = created; 400 with "already exists" = already present — both are fine.
+    if status not in {200, 201} and not (
+        status == 400
+        and isinstance(body, dict)
+        and "exist" in str(body).lower()
+    ):
+        raise RuntimeError(f"Registration failed for {user['username']}: {body}")
 
 
 def login_user(user):
-    """
-    Authenticate a user and return their Bearer token.
-
-    Args:
-        user (dict): User data with keys: username, password.
-
-    Returns:
-        str: JWT Bearer token from the auth_token field.
-
-    Raises:
-        Exception: If the server returns a non-200 status code.
-    """
-    print(f"[3] Login user: {user['username']}")
-
     status, body = send_request(
         "POST",
         f"{BASE_URL}/users/v1/login",
-        json_data={
+        body={
             "username": user["username"],
             "password": user["password"]
         }
     )
 
     print("Status:", status)
-    print("Response:", body)
 
-    if status != 200:
-        raise Exception(f"Login failed for {user['username']}")
+    if status != 200 or not isinstance(body, dict) or "auth_token" not in body:
+        raise RuntimeError(f"Login failed for {user['username']}: {body}")
 
     return body["auth_token"]
 
 
-def create_victim_book(victim_token):
-    """
-    Create a book resource owned by the victim user.
+# --- POSTMAN COLLECTION PARSING ---
 
-    The created book serves as the target resource for BOLA and
-    Excessive Data Exposure tests. Its title and secret are defined
-    in VICTIM_BOOK.
+def load_postman_collection(file_path):
+    with open(file_path, "r", encoding="utf-8") as file:
+        collection = json.load(file)
 
-    Args:
-        victim_token (str): Bearer token of the victim user.
-    """
-    print("[4] Victim creates book")
+    endpoints = []
 
-    status, body = send_request(
-        "POST",
-        f"{BASE_URL}/books/v1",
-        token=victim_token,
-        json_data={
-            "book_title": VICTIM_BOOK["book_title"],
-            "secret": VICTIM_BOOK["secret"]
-        }
-    )
+    def walk(items, folder=""):
+        for item in items:
+            item_name = item.get("name", "No name")
 
-    print("Status:", status)
-    print("Response:", body)
-
-
-# --- OPENAPI PARSING ---
-
-def load_openapi():
-    """
-    Load and parse the OpenAPI specification from OPENAPI_FILE.
-
-    Returns:
-        dict: Parsed OpenAPI document.
-
-    Raises:
-        FileNotFoundError: If OPENAPI_FILE does not exist.
-        json.JSONDecodeError: If the file contains invalid JSON.
-    """
-    with open(OPENAPI_FILE, "r", encoding="utf-8") as file:
-        return json.load(file)
-
-
-def get_path_params(operation):
-    """
-    Extract path parameter names from an OpenAPI operation object.
-
-    Filters parameters where ``in`` equals ``"path"``.
-
-    Args:
-        operation (dict): OpenAPI operation object (e.g. the value of
-            ``paths["/users/v1/{username}"]["get"]``).
-
-    Returns:
-        list[str]: List of path parameter names.
-
-    Example:
-        For /users/v1/{username} -> ["username"]
-        For /books/v1/{book_title} -> ["book_title"]
-    """
-    return [
-        param.get("name")
-        for param in operation.get("parameters", [])
-        if param.get("in") == "path"
-    ]
-
-
-def is_bola_candidate(http_method, operation):
-    """
-    Determine whether an endpoint is a candidate for BOLA testing.
-
-    An endpoint qualifies if all three conditions are met:
-    1. Its HTTP method is in CANDIDATE_METHODS.
-    2. It has at least one path parameter.
-    3. At least one path parameter name is in RESOURCE_PARAMS.
-
-    Args:
-        http_method (str): HTTP method string (e.g. "get", "post").
-        operation (dict): OpenAPI operation object.
-
-    Returns:
-        bool: True if the endpoint should be tested for BOLA.
-    """
-    if http_method.upper() not in CANDIDATE_METHODS:
-        return False
-
-    path_params = get_path_params(operation)
-    return any(param in RESOURCE_PARAMS for param in path_params)
-
-
-def get_value_for_path_param(param_name):
-    """
-    Resolve a concrete value for a given path parameter name.
-
-    Lookup order:
-    1. PARAM_VALUES — returns victim's resource identifier.
-    2. If param name contains "id" — returns "1" (common integer ID).
-    3. Fallback — returns "test".
-
-    Args:
-        param_name (str): Name of the path parameter.
-
-    Returns:
-        str: Value to substitute into the URL.
-    """
-    if param_name in PARAM_VALUES:
-        return PARAM_VALUES[param_name]
-
-    if "id" in param_name.lower():
-        return "1"
-
-    return "test"
-
-
-def build_url(path, path_params):
-    """
-    Build a concrete URL by substituting path parameters with victim values.
-
-    Args:
-        path (str): OpenAPI path template (e.g. "/users/v1/{username}").
-        path_params (list[str]): List of parameter names to substitute.
-
-    Returns:
-        str: Full URL with all placeholders replaced.
-
-    Example:
-        "/users/v1/{username}" -> "http://127.0.0.1:5000/users/v1/victim_user"
-    """
-    final_path = path
-
-    for param in path_params:
-        value = get_value_for_path_param(param)
-        final_path = final_path.replace("{" + param + "}", value)
-
-    return BASE_URL + final_path
-
-
-def build_body_from_schema(operation):
-    """
-    Build a JSON request body from an OpenAPI operation's requestBody schema.
-
-    Traverses: requestBody -> content -> application/json -> schema -> properties.
-    For each property, resolves a value from FIELD_VALUES. If the field is
-    not in FIELD_VALUES, falls back to the schema's own ``example`` value,
-    then to the string ``"test"``.
-
-    Note:
-        Does not resolve $ref references. Operations with schemas that use
-        $ref will produce an empty body (None).
-
-    Args:
-        operation (dict): OpenAPI operation object.
-
-    Returns:
-        dict | None: Request body dict, or None if no requestBody is defined
-            or no properties are found.
-    """
-    request_body = operation.get("requestBody")
-
-    if not request_body:
-        return None
-
-    properties = (
-        request_body
-        .get("content", {})
-        .get("application/json", {})
-        .get("schema", {})
-        .get("properties", {})
-    )
-
-    if not properties:
-        return None
-
-    return {
-        field_name: FIELD_VALUES.get(field_name, field_schema.get("example", "test"))
-        for field_name, field_schema in properties.items()
-    }
-
-
-def get_test_url(path, operation):
-    """
-    Build the test URL for a given path and operation.
-
-    If the operation has path parameters, substitutes them with victim values.
-    Otherwise returns the path appended to BASE_URL as-is.
-
-    Args:
-        path (str): OpenAPI path template.
-        operation (dict): OpenAPI operation object.
-
-    Returns:
-        str: Full URL ready for use in a request.
-    """
-    path_params = get_path_params(operation)
-    return build_url(path, path_params) if path_params else BASE_URL + path
-
-
-# --- RESULT HELPERS ---
-
-def check_result(method, status):
-    """
-    Classify a BOLA test result based on HTTP method and response status.
-
-    Args:
-        method (str): HTTP method used in the request.
-        status (int): HTTP status code returned by the server.
-
-    Returns:
-        str: One of:
-            - "BOLA FOUND" — status indicates unauthorized access succeeded.
-            - "OK: access denied" — status indicates access was correctly blocked.
-            - "CHECK MANUALLY: unexpected status" — status is ambiguous, requires human review.
-    """
-    if status in SUCCESS_STATUSES.get(method.upper(), []):
-        return "BOLA FOUND"
-
-    if status in PROTECTED_STATUSES:
-        return "OK: access denied"
-
-    return "CHECK MANUALLY: unexpected status"
-
-
-def make_scan_result(name):
-    """
-    Create an empty scan result container.
-
-    Args:
-        name (str): Human-readable name for the scan (e.g. "BOLA").
-
-    Returns:
-        dict: Scan result with keys: name, checked (int), issues (int), items (list).
-    """
-    return {"name": name, "checked": 0, "issues": 0, "items": []}
-
-
-def add_scan_item(scan_result, title, method, path, url, status, result, response_body):
-    """
-    Append a single check result to a scan result container.
-
-    Increments ``checked`` counter unconditionally. Increments ``issues``
-    counter if the result string contains "FOUND" or "CHECK MANUALLY".
-
-    Args:
-        scan_result (dict): Container returned by make_scan_result().
-        title (str): Human-readable label for this check.
-        method (str): HTTP method used.
-        path (str): Original OpenAPI path template.
-        url (str): Actual URL that was tested.
-        status (int | None): HTTP status code, or None for non-HTTP checks
-            (e.g. user enumeration).
-        result (str): Classification string (e.g. "BOLA FOUND", "OK: ...").
-        response_body (dict | str): Response body from the server.
-    """
-    scan_result["checked"] += 1
-
-    if "FOUND" in result or "CHECK MANUALLY" in result:
-        scan_result["issues"] += 1
-
-    scan_result["items"].append({
-        "title": title,
-        "method": method.upper(),
-        "path": path,
-        "url": url,
-        "status": status,
-        "result": result,
-        "response": response_body
-    })
-
-
-# --- BOLA SCAN ---
-
-def scan_bola(attacker_token, openapi):
-    """
-    Scan all OpenAPI endpoints for Broken Object Level Authorization (BOLA).
-
-    For each endpoint identified as a BOLA candidate (see is_bola_candidate),
-    sends a request authenticated as the attacker but targeting the victim's
-    resources. A successful response (2xx) indicates that the server does not
-    enforce object-level authorization.
-
-    Endpoints are tested in GET -> POST -> PUT -> DELETE order within each path.
-
-    Args:
-        attacker_token (str): Bearer token of the attacker user.
-        openapi (dict): Parsed OpenAPI document.
-
-    Returns:
-        dict: Scan result container populated with one item per tested endpoint.
-    """
-    print("[5] Start BOLA scan")
-
-    paths = openapi.get("paths", {})
-    scan_result = make_scan_result("BOLA")
-
-    for path, path_item in paths.items():
-        methods = sorted(path_item.keys(), key=lambda m: METHOD_ORDER.get(m, 99))
-
-        for http_method in methods:
-            operation = path_item.get(http_method)
-
-            if not isinstance(operation, dict):
+            if "item" in item:
+                next_folder = f"{folder}/{item_name}" if folder else item_name
+                walk(item.get("item", []), next_folder)
                 continue
 
-            if not is_bola_candidate(http_method, operation):
-                continue
+            request = item.get("request")
 
-            url = get_test_url(path, operation)
-            body = build_body_from_schema(operation)
+            if request:
+                endpoints.append(parse_postman_request(item_name, folder, request))
 
-            status, response_body = send_request(
-                method=http_method.upper(),
-                url=url,
-                token=attacker_token,
-                json_data=body
-            )
+    walk(collection.get("item", []))
 
-            add_scan_item(
-                scan_result=scan_result,
-                title=operation.get("summary", "No summary"),
-                method=http_method,
-                path=path,
-                url=url,
-                status=status,
-                result=check_result(http_method, status),
-                response_body=response_body
-            )
-
-    return scan_result
+    return endpoints
 
 
-# --- BROKEN AUTH SCAN ---
-
-def scan_broken_auth(openapi):
-    """
-    Scan all protected OpenAPI endpoints for Broken Authentication issues.
-
-    An endpoint is considered protected if its OpenAPI operation contains
-    a ``security`` field. Each such endpoint is tested twice:
-
-    1. **No token** — request sent without an Authorization header.
-    2. **Invalid token** — request sent with a malformed Bearer token.
-
-    Additionally, performs a **user enumeration** check by comparing
-    server responses for an existing user with a wrong password versus
-    a non-existing user. Different status codes or response bodies
-    indicate that the API leaks user existence information.
-
-    Args:
-        openapi (dict): Parsed OpenAPI document.
-
-    Returns:
-        dict: Scan result container populated with two items per protected
-            endpoint plus one item for the enumeration check.
-    """
-    print("[6] Start Broken Authentication scan")
-
-    paths = openapi.get("paths", {})
-    scan_result = make_scan_result("Broken Authentication")
-    invalid_token = "invalid.token.value"
-
-    for path, path_item in paths.items():
-        for http_method, operation in path_item.items():
-            if not isinstance(operation, dict):
-                continue
-
-            if "security" not in operation:
-                continue
-
-            url = get_test_url(path, operation)
-            body = build_body_from_schema(operation)
-            summary = operation.get("summary", "No summary")
-
-            for label, token in [("no token", None), ("bad token", invalid_token)]:
-                status, response_body = send_request(
-                    method=http_method.upper(),
-                    url=url,
-                    token=token,
-                    json_data=body
-                )
-
-                if status in SUCCESS_STATUSES.get(http_method.upper(), []):
-                    result = f"BROKEN AUTH FOUND: protected endpoint works with {label}"
-                elif status in PROTECTED_STATUSES:
-                    result = f"OK: access with {label} denied"
-                else:
-                    result = f"CHECK MANUALLY: unexpected status with {label}"
-
-                add_scan_item(
-                    scan_result=scan_result,
-                    title=f"{summary} | {label}",
-                    method=http_method,
-                    path=path,
-                    url=url,
-                    status=status,
-                    result=result,
-                    response_body=response_body
-                )
-
-    status_existing, body_existing = send_request(
-        method="POST",
-        url=f"{BASE_URL}/users/v1/login",
-        json_data={"username": ATTACKER["username"], "password": "wrong_password_123"}
-    )
-
-    status_non_existing, body_non_existing = send_request(
-        method="POST",
-        url=f"{BASE_URL}/users/v1/login",
-        json_data={"username": "user_that_does_not_exist_123", "password": "wrong_password_123"}
-    )
-
-    existing_response = json.dumps(body_existing, sort_keys=True, ensure_ascii=False)
-    non_existing_response = json.dumps(body_non_existing, sort_keys=True, ensure_ascii=False)
-
-    if status_existing != status_non_existing or existing_response != non_existing_response:
-        enumeration_result = (
-            "CHECK MANUALLY: login responses are different "
-            f"(existing: {status_existing}, non-existing: {status_non_existing})"
-        )
+def parse_postman_request(name, folder, request):
+    if isinstance(request, str):
+        raw_url = request
+        method = "GET"
+        url_data = {}
+        headers = {}
+        auth_type = None
+        body_mode = None
+        body = None
     else:
-        enumeration_result = "OK: login responses look similar"
+        method = request.get("method", "GET").upper()
+        url_data = request.get("url", {})
+        raw_url = url_data.get("raw", "") if isinstance(url_data, dict) else str(url_data)
 
-    add_scan_item(
-        scan_result=scan_result,
-        title="User/password enumeration check",
-        method="POST",
-        path="/users/v1/login",
-        url=f"{BASE_URL}/users/v1/login",
-        status=None,
-        result=enumeration_result,
-        response_body={
-            "existing_user_wrong_password": body_existing,
-            "non_existing_user": body_non_existing
+        headers = {
+            header["key"]: header.get("value", "")
+            for header in request.get("header", [])
+            if not header.get("disabled") and header.get("key")
         }
+
+        auth = request.get("auth") or {}
+        auth_type = auth.get("type")
+
+        body_mode, body = parse_postman_body(request.get("body"))
+
+    path_variables = extract_path_variables(url_data)
+    path = extract_postman_path(url_data, raw_url)
+    resolved_url = resolve_postman_url(raw_url, path_variables)
+    resolved_path = urlparse(resolved_url).path or "/"
+
+    return Endpoint(
+        name=name,
+        folder=folder,
+        method=method,
+        raw_url=raw_url,
+        url=resolved_url,
+        path=path,
+        resolved_path=resolved_path,
+        headers=headers,
+        body=body,
+        body_mode=body_mode,
+        auth_type=auth_type,
+        path_variables=path_variables
     )
 
-    return scan_result
+
+def parse_postman_body(body_data):
+    if not body_data:
+        return None, None
+
+    mode = body_data.get("mode")
+
+    if mode == "raw":
+        raw_body = body_data.get("raw", "")
+
+        try:
+            return mode, json.loads(raw_body)
+        except json.JSONDecodeError:
+            return mode, raw_body
+
+    if mode in {"urlencoded", "formdata"}:
+        return mode, {
+            item["key"]: item.get("value", "")
+            for item in body_data.get(mode, [])
+            if not item.get("disabled") and item.get("key")
+        }
+
+    return mode, body_data
 
 
-# --- EXCESSIVE DATA EXPOSURE SCAN ---
+def extract_path_variables(url_data):
+    if not isinstance(url_data, dict):
+        return {}
+
+    variables = {}
+
+    for variable in url_data.get("variable", []):
+        key = variable.get("key")
+
+        if key:
+            variables[key] = HARDCODED_VALUES.get(key, variable.get("value", ""))
+
+    return variables
+
+
+def extract_postman_path(url_data, raw_url):
+    if isinstance(url_data, dict) and url_data.get("path"):
+        path = "/" + "/".join(str(part) for part in url_data["path"])
+        return path if path != "/" else "/"
+
+    if raw_url.startswith("{{baseUrl}}"):
+        path = raw_url.replace("{{baseUrl}}", "", 1)
+        return path or "/"
+
+    if raw_url.startswith("http://") or raw_url.startswith("https://"):
+        return urlparse(raw_url).path or "/"
+
+    return raw_url if raw_url.startswith("/") else f"/{raw_url}"
+
+
+def resolve_postman_url(raw_url, path_variables):
+    resolved_url = raw_url
+
+    for key, value in HARDCODED_VALUES.items():
+        resolved_url = resolved_url.replace("{{" + key + "}}", str(value))
+
+    for key, value in path_variables.items():
+        resolved_url = resolved_url.replace(":" + key, str(value))
+
+    return resolved_url
+
+
+# --- SCAN HELPERS ---
+
+def short_response_preview(response_body, max_length=500):
+    if response_body is None:
+        return ""
+
+    if isinstance(response_body, (dict, list)):
+        text = json.dumps(response_body, ensure_ascii=False)
+    else:
+        text = str(response_body)
+
+    return text if len(text) <= max_length else text[:max_length] + "...[truncated]"
+
 
 def find_sensitive_fields(data, current_path=""):
-    """
-    Recursively search a JSON structure for sensitive field names.
-
-    Traverses dicts and lists. For each dict key, checks whether its
-    lowercase name appears in SENSITIVE_FIELDS. Returns the full
-    dot/bracket-notation path to each match, enabling precise location
-    of the leak within nested structures.
-
-    Args:
-        data (dict | list | any): JSON-decoded response body or any
-            nested value within it.
-        current_path (str): Dot-notation path accumulated during recursion.
-            Should be left as default ("") on the initial call.
-
-    Returns:
-        list[str]: Paths to all sensitive fields found.
-
-    Example:
-        {"user": {"password": "secret"}} -> ["user.password"]
-        [{"token": "abc"}]               -> ["[0].token"]
-    """
     found = []
 
     if isinstance(data, dict):
@@ -721,159 +470,416 @@ def find_sensitive_fields(data, current_path=""):
 
     elif isinstance(data, list):
         for index, item in enumerate(data):
-            found.extend(find_sensitive_fields(item, f"{current_path}[{index}]"))
+            item_path = f"{current_path}[{index}]" if current_path else f"[{index}]"
+            found.extend(find_sensitive_fields(item, item_path))
 
     return found
 
 
-def scan_excessive_data_exposure(token, openapi):
-    """
-    Scan all GET endpoints for Excessive Data Exposure.
+def build_bola_body(endpoint):
+    if not isinstance(endpoint.body, dict):
+        return endpoint.body
 
-    Sends an authenticated GET request to every endpoint that defines
-    a ``get`` operation in the OpenAPI spec. For responses with status 200,
-    recursively inspects the response body for fields listed in
-    SENSITIVE_FIELDS. A match indicates that the API returns data that
-    should not be exposed to the client.
+    body = dict(endpoint.body)
 
-    5xx responses are flagged as CHECK MANUALLY — a server error may
-    indicate information disclosure via debug pages or stack traces.
+    if endpoint.resolved_path.endswith("/email"):
+        body["email"] = "attacker_changed@mail.com"
 
-    Endpoints returning other non-200 status codes are skipped (marked as SKIP).
+    if endpoint.resolved_path.endswith("/password"):
+        body["password"] = "attacker_changed_pass"
 
-    Args:
-        token (str): Bearer token for authentication (attacker's token).
-        openapi (dict): Parsed OpenAPI document.
+    return body
 
-    Returns:
-        dict: Scan result container populated with one item per GET endpoint.
-    """
-    print("[7] Start Excessive Data Exposure scan")
 
-    paths = openapi.get("paths", {})
-    scan_result = make_scan_result("Excessive Data Exposure")
+# --- DATA EXPOSURE SCAN ---
 
-    for path, path_item in paths.items():
-        operation = path_item.get("get")
+def scan_data_exposure(endpoints, token):
+    print("[7] Scan Excessive Data Exposure")
 
-        if not isinstance(operation, dict):
+    results = {}
+
+    for endpoint in endpoints:
+        if endpoint.is_excluded_from_scan or endpoint.method != "GET":
             continue
 
-        url = get_test_url(path, operation)
-        status, response_body = send_request(method="GET", url=url, token=token)
+        request_token = token if endpoint.auth_type == "bearer" else None
+        status, body = send_endpoint_request(endpoint, token=request_token)
 
         if status == 200:
-            sensitive_fields = find_sensitive_fields(response_body)
-            result = (
-                f"EXCESSIVE DATA EXPOSURE FOUND: {sensitive_fields}"
-                if sensitive_fields
-                else "OK: no sensitive fields found"
-            )
-        elif status >= 500:
-            result = "CHECK MANUALLY: server error — possible information disclosure"
-        else:
-            result = "OK: endpoint did not return 200"
+            sensitive_fields = find_sensitive_fields(body)
 
-        add_scan_item(
-            scan_result=scan_result,
-            title=operation.get("summary", "No summary"),
-            method="GET",
-            path=path,
-            url=url,
-            status=status,
-            result=result,
-            response_body=response_body
+            if sensitive_fields:
+                results[endpoint.key] = CheckResult(
+                    status=STATUS_FAIL,
+                    http_status=status,
+                    reason="Response exposes sensitive fields",
+                    evidence=[
+                        f"Tested URL: {endpoint.url}",
+                        f"Sensitive fields found: {', '.join(sensitive_fields)}",
+                        "This may indicate Excessive Data Exposure.",
+                        "The API should return only fields required by the client.",
+                        f"Response preview: {short_response_preview(body)}"
+                    ]
+                )
+            else:
+                results[endpoint.key] = CheckResult(
+                    status=STATUS_PASS,
+                    http_status=status,
+                    reason="No sensitive fields found in response"
+                )
+
+        elif status >= 500:
+            results[endpoint.key] = CheckResult(
+                status=STATUS_REVIEW,
+                http_status=status,
+                reason="Server error, possible information disclosure",
+                evidence=[
+                    f"Tested URL: {endpoint.url}",
+                    f"Response preview: {short_response_preview(body)}"
+                ]
+            )
+
+        elif status == 0:
+            results[endpoint.key] = CheckResult(
+                status=STATUS_REVIEW,
+                http_status=status,
+                reason="Request failed",
+                evidence=[
+                    f"Tested URL: {endpoint.url}",
+                    f"Error: {short_response_preview(body)}"
+                ]
+            )
+
+        else:
+            results[endpoint.key] = CheckResult(
+                status=STATUS_PASS,
+                http_status=status,
+                reason="Endpoint did not return data"
+            )
+
+    return results
+
+
+# --- AUTH SCAN ---
+
+def scan_auth(endpoints):
+    print("[8] Scan Broken Authentication")
+
+    results = {}
+
+    for endpoint in endpoints:
+        if endpoint.is_excluded_from_scan or endpoint.auth_type != "bearer":
+            continue
+
+        failed_cases = []
+        review_cases = []
+
+        for label, token in [("missing token", None), ("invalid token", "invalid.token.value")]:
+            status, body = send_endpoint_request(endpoint, token=token)
+
+            case = {
+                "label": label,
+                "status": status,
+                "body": body
+            }
+
+            if status in SUCCESS_STATUSES.get(endpoint.method, set()):
+                failed_cases.append(case)
+            elif status not in PROTECTED_STATUSES:
+                review_cases.append(case)
+
+        if failed_cases:
+            evidence = [
+                "Endpoint is marked as bearer-protected in Postman collection.",
+                f"Tested URL: {endpoint.url}",
+                "Protected endpoint should reject missing or invalid tokens."
+            ]
+
+            for case in failed_cases:
+                evidence.append(f"Accepted request with {case['label']} | status={case['status']}")
+                evidence.append(f"Response preview: {short_response_preview(case['body'])}")
+
+            results[endpoint.key] = CheckResult(
+                status=STATUS_FAIL,
+                reason="Protected endpoint accepted unauthenticated or invalid-token request",
+                evidence=evidence
+            )
+
+        elif review_cases:
+            evidence = [
+                "Endpoint is marked as bearer-protected in Postman collection.",
+                f"Tested URL: {endpoint.url}",
+                "Expected response for missing/invalid token is usually 401, 403 or 404."
+            ]
+
+            for case in review_cases:
+                evidence.append(f"Unexpected status with {case['label']} | status={case['status']}")
+                evidence.append(f"Response preview: {short_response_preview(case['body'])}")
+
+            results[endpoint.key] = CheckResult(
+                status=STATUS_REVIEW,
+                reason="Authentication behavior is ambiguous",
+                evidence=evidence
+            )
+
+        else:
+            results[endpoint.key] = CheckResult(
+                status=STATUS_PASS,
+                reason="Missing and invalid tokens were rejected"
+            )
+
+    return results
+
+
+# --- BOLA SCAN ---
+
+def is_bola_candidate(endpoint):
+    if endpoint.is_excluded_from_scan:
+        return False
+
+    if endpoint.method not in BOLA_METHODS:
+        return False
+
+    if endpoint.method == "DELETE" and not ENABLE_DESTRUCTIVE_BOLA:
+        return False
+
+    if endpoint.auth_type != "bearer":
+        return False
+
+    if any(key in BOLA_RESOURCE_KEYS for key in endpoint.path_variables):
+        return True
+
+    lower_path = endpoint.path.lower()
+
+    return any(
+        marker in lower_path
+        for marker in [
+            ":id",
+            ":username",
+            ":user_id",
+            ":book_title",
+            ":account_id",
+            ":resource_id"
+        ]
+    )
+
+
+def scan_bola(endpoints, attacker_token):
+    print("[9] Scan BOLA / IDOR")
+
+    results = {}
+
+    candidates = sorted(
+        [endpoint for endpoint in endpoints if is_bola_candidate(endpoint)],
+        key=lambda endpoint: BOLA_METHOD_ORDER.get(endpoint.method, 99)
+    )
+
+    for endpoint in candidates:
+        bola_body = build_bola_body(endpoint)
+
+        status, body = send_endpoint_request(
+            endpoint=endpoint,
+            token=attacker_token,
+            body_override=bola_body
         )
 
-    return scan_result
+        if status in SUCCESS_STATUSES.get(endpoint.method, set()):
+            results[endpoint.key] = CheckResult(
+                status=STATUS_FAIL,
+                http_status=status,
+                reason="Attacker accessed or modified victim-owned object",
+                evidence=[
+                    f"Tested URL: {endpoint.url}",
+                    f"Method: {endpoint.method}",
+                    f"Path variables: {json.dumps(endpoint.path_variables, ensure_ascii=False)}",
+                    f"Attacker username: {ATTACKER['username']}",
+                    f"Victim username: {VICTIM['username']}",
+                    f"Victim book title: {VICTIM_BOOK['book_title']}",
+                    "The request was sent with attacker token but used victim identifier.",
+                    "Successful response may indicate missing object-level authorization.",
+                    "This matches BOLA / IDOR vulnerability pattern.",
+                    f"Request body: {short_response_preview(bola_body)}",
+                    f"Response preview: {short_response_preview(body)}"
+                ]
+            )
+
+        elif status in PROTECTED_STATUSES:
+            results[endpoint.key] = CheckResult(
+                status=STATUS_PASS,
+                http_status=status,
+                reason="Access to victim object was denied"
+            )
+
+        elif status == 0:
+            results[endpoint.key] = CheckResult(
+                status=STATUS_REVIEW,
+                http_status=status,
+                reason="Request failed",
+                evidence=[
+                    f"Tested URL: {endpoint.url}",
+                    f"Response preview: {short_response_preview(body)}"
+                ]
+            )
+
+        else:
+            results[endpoint.key] = CheckResult(
+                status=STATUS_REVIEW,
+                http_status=status,
+                reason="Unexpected status during BOLA test",
+                evidence=[
+                    f"Tested URL: {endpoint.url}",
+                    f"Expected protected status: {sorted(PROTECTED_STATUSES)}",
+                    f"Expected success status for finding: {sorted(SUCCESS_STATUSES.get(endpoint.method, set()))}",
+                    f"Actual status: {status}",
+                    f"Request body: {short_response_preview(bola_body)}",
+                    f"Response preview: {short_response_preview(body)}"
+                ]
+            )
+
+    return results
 
 
-# --- FINAL REPORT ---
+# --- REPORT ---
 
-def print_final_report(scan_results):
-    """
-    Print a structured report of all scan results to stdout.
+def print_endpoint_report(endpoints, data_results, auth_results, bola_results):
+    print("\n" + "=" * 80)
+    print("ENDPOINT-BASED SECURITY REPORT")
+    print("=" * 80)
 
-    Outputs a detailed section for each scanner (per-item breakdown),
-    followed by a total summary across all scanners.
+    summary = {
+        STATUS_FAIL: 0,
+        STATUS_PASS: 0,
+        STATUS_REVIEW: 0,
+        STATUS_NA: 0
+    }
 
-    Summary counters:
-    - **Total checks**: sum of all items across all scanners.
-    - **Total found**: items where result contains "FOUND" or "CHECK MANUALLY".
-    - **Total ok**: remaining items (total_checks - total_found).
+    executed_checks = 0
+    json_report = {"endpoints": []}
 
-    Args:
-        scan_results (list[dict]): List of scan result containers as returned
-            by scan_bola(), scan_broken_auth(), scan_excessive_data_exposure().
-    """
-    print("\n" + "=" * 60)
-    print("FINAL SCAN REPORT")
-    print("=" * 60)
+    for endpoint in endpoints:
+        results = {
+            "bola": bola_results.get(endpoint.key, CheckResult(STATUS_NA)),
+            "auth": auth_results.get(endpoint.key, CheckResult(STATUS_NA)),
+            "data": data_results.get(endpoint.key, CheckResult(STATUS_NA))
+        }
 
-    for scan_result in scan_results:
-        print(f"\n[{scan_result['name']}]")
-        print("Checked:", scan_result["checked"])
-        print("Potential issues:", scan_result["issues"])
+        print(f"\n- {endpoint.method} {endpoint.resolved_path}")
+        print(f"  name: {endpoint.name}")
+        print(f"  url: {endpoint.url}")
 
-        for item in scan_result["items"]:
-            print("\n------------------------------")
-            print("Check:", item["title"])
-            print("Method:", item["method"])
-            print("Swagger path:", item["path"])
-            print("Tested URL:", item["url"])
-            print("Status:", item["status"])
-            print("Result:", item["result"])
-            print("Response:", item["response"])
+        if endpoint.is_excluded_from_scan:
+            print("  note: excluded from scans because it changes application state")
 
-    total_checked = sum(r["checked"] for r in scan_results)
-    total_found = sum(r["issues"] for r in scan_results)
-    total_ok = total_checked - total_found
+        endpoint_entry = {
+            "method": endpoint.method,
+            "path": endpoint.resolved_path,
+            "name": endpoint.name,
+            "url": endpoint.url,
+            "excluded": endpoint.is_excluded_from_scan,
+            "checks": {}
+        }
 
-    print("\n" + "=" * 60)
-    print("TOTAL SUMMARY")
-    print("=" * 60)
-    print("Total checks:", total_checked)
-    print("Total found:", total_found)
-    print("Total ok:", total_ok)
-    print("\n" + "=" * 60)
-    print("END OF REPORT")
-    print("=" * 60)
+        for check_name, result in results.items():
+            summary[result.status] += 1
+
+            if result.status != STATUS_NA:
+                executed_checks += 1
+
+            print_check_result(check_name, result)
+
+            endpoint_entry["checks"][check_name] = {
+                "status": result.status,
+                "http_status": result.http_status,
+                "reason": result.reason,
+                "evidence": result.evidence or []
+            }
+
+        json_report["endpoints"].append(endpoint_entry)
+
+    print("\n" + "=" * 80)
+    print("SUMMARY")
+    print("=" * 80)
+    print("endpoints:", len(endpoints))
+    print("executed checks:", executed_checks)
+    print("fail:", summary[STATUS_FAIL])
+    print("pass:", summary[STATUS_PASS])
+    print("review:", summary[STATUS_REVIEW])
+    print("not applicable:", summary[STATUS_NA])
+
+    json_report["summary"] = {
+        "endpoints": len(endpoints),
+        "executed_checks": executed_checks,
+        "fail": summary[STATUS_FAIL],
+        "pass": summary[STATUS_PASS],
+        "review": summary[STATUS_REVIEW],
+        "not_applicable": summary[STATUS_NA]
+    }
+
+    report_path = "scan_report.json"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(json_report, f, indent=2, ensure_ascii=False)
+    print(f"\nJSON report saved: {report_path}")
+
+    return summary[STATUS_FAIL]
+
+
+def print_check_result(check_name, result):
+    if result.status == STATUS_NA:
+        print(f"  {check_name}: N/A")
+        return
+
+    print(f"  {check_name}: {result.status}")
+
+    if result.http_status is not None:
+        print(f"    http_status: {result.http_status}")
+
+    if result.reason:
+        print(f"    reason: {result.reason}")
+
+    if result.status in {STATUS_FAIL, STATUS_REVIEW} and result.evidence:
+        print("    evidence:")
+        for item in result.evidence:
+            print(f"      - {item}")
 
 
 # --- MAIN ---
 
 def main():
-    """
-    Entry point. Orchestrates environment setup and all scan phases.
+    try:
+        endpoints = load_postman_collection(POSTMAN_COLLECTION_FILE)
 
-    Execution order:
-    1. Reset database.
-    2. Register attacker and victim users.
-    3. Authenticate both users and obtain their tokens.
-    4. Victim creates a book resource.
-    5. Load OpenAPI specification.
-    6. Run BOLA, Broken Authentication, and Excessive Data Exposure scans.
-    7. Print the final aggregated report.
-    """
-    reset_db()
+        print("Loaded endpoints:", len(endpoints))
+        print("Base URL:", BASE_URL)
 
-    register_user(ATTACKER)
-    register_user(VICTIM)
+        attacker_token, _ = setup_vampi()
 
-    attacker_token = login_user(ATTACKER)
-    victim_token = login_user(VICTIM)
+        data_results = scan_data_exposure(endpoints, attacker_token)
+        auth_results = scan_auth(endpoints)
+        bola_results = scan_bola(endpoints, attacker_token)
 
-    create_victim_book(victim_token)
+        fail_count = print_endpoint_report(
+            endpoints=endpoints,
+            data_results=data_results,
+            auth_results=auth_results,
+            bola_results=bola_results
+        )
 
-    openapi = load_openapi()
+        if fail_count > 0:
+            sys.exit(1)
 
-    scan_results = [
-        scan_bola(attacker_token, openapi),
-        scan_broken_auth(openapi),
-        scan_excessive_data_exposure(attacker_token, openapi)
-    ]
+    except FileNotFoundError:
+        print(f"ERROR: file not found: {POSTMAN_COLLECTION_FILE}")
+        print("Put VAmPI.postman_collection.json near scanner.py or change POSTMAN_COLLECTION_FILE.")
+        sys.exit(1)
 
-    print_final_report(scan_results)
+    except json.JSONDecodeError as error:
+        print(f"ERROR: invalid JSON in {POSTMAN_COLLECTION_FILE}")
+        print("Details:", error)
+        sys.exit(1)
+
+    except RuntimeError as error:
+        print("ERROR:", error)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
